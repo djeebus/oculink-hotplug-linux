@@ -3,6 +3,10 @@
 
 set -e
 
+# Resolve the directory this script lives in; all payload files are expected
+# to sit next to it.
+SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
+
 echo "🔌 OCuLink GPU Hot-plug Safety Setup"
 echo "===================================="
 echo
@@ -13,22 +17,47 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-echo "📁 Installing files..."
+BIN_FILES=(
+    oculink-gpu-manager
+    oculink-gpu-watcher
+    oculink-reconnect-monitor
+    oculink-removal-watcher
+    oculink-kernel-config
+    gpu-safe-remove
+)
+UDEV_FILES=(99-oculink-gpu-hotplug.rules)
+SERVICE_FILES=(
+    oculink-gpu-monitor.service
+    oculink-kernel-safety.service
+)
+
+# Make sure everything we need is present before touching the system
+missing=()
+for f in "${BIN_FILES[@]}" "${UDEV_FILES[@]}" "${SERVICE_FILES[@]}"; do
+    [ -f "$SCRIPT_DIR/$f" ] || missing+=("$f")
+done
+if [ ${#missing[@]} -ne 0 ]; then
+    echo "❌ Missing files in $SCRIPT_DIR:"
+    printf '   • %s\n' "${missing[@]}"
+    exit 1
+fi
+
+echo "📁 Installing files from $SCRIPT_DIR..."
 
 # Install scripts
-install -m 755 /tmp/oculink-gpu-manager /usr/local/bin/
-install -m 755 /tmp/oculink-gpu-watcher /usr/local/bin/
-install -m 755 /tmp/oculink-reconnect-monitor /usr/local/bin/
-install -m 755 /tmp/oculink-removal-watcher /usr/local/bin/
-install -m 755 /tmp/oculink-kernel-config /usr/local/bin/
-install -m 755 /tmp/gpu-safe-remove /usr/local/bin/
+for f in "${BIN_FILES[@]}"; do
+    install -m 755 "$SCRIPT_DIR/$f" /usr/local/bin/
+done
 
 # Install udev rules
-install -m 644 /tmp/99-oculink-gpu-hotplug.rules /etc/udev/rules.d/
+for f in "${UDEV_FILES[@]}"; do
+    install -m 644 "$SCRIPT_DIR/$f" /etc/udev/rules.d/
+done
 
 # Install systemd services
-install -m 644 /tmp/oculink-gpu-monitor.service /etc/systemd/system/
-install -m 644 /tmp/oculink-kernel-safety.service /etc/systemd/system/
+for f in "${SERVICE_FILES[@]}"; do
+    install -m 644 "$SCRIPT_DIR/$f" /etc/systemd/system/
+done
 
 echo "🔄 Reloading system configuration..."
 
@@ -40,8 +69,9 @@ udevadm trigger
 systemctl daemon-reload
 systemctl enable oculink-gpu-monitor.service
 systemctl enable oculink-kernel-safety.service
-systemctl start oculink-gpu-monitor.service
-systemctl start oculink-kernel-safety.service
+# restart (not start) so re-running the installer picks up updated binaries
+systemctl restart oculink-gpu-monitor.service
+systemctl restart oculink-kernel-safety.service
 
 # Create log directory
 mkdir -p /var/log

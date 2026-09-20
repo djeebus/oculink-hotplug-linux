@@ -15,15 +15,9 @@ A comprehensive Linux solution for safely hot-plugging OCuLink external GPUs, sp
 
 ### Installation
 ```bash
-# Copy all files from /tmp to home directory
-cp /tmp/gpu-safe-remove ~/
-cp /tmp/oculink-* ~/
-cp /tmp/install-oculink-hotplug.sh ~/
-cp /tmp/99-oculink-gpu-hotplug.rules ~/
-
-# Run installer (requires root)
-chmod +x ~/install-oculink-hotplug.sh
-sudo ~/install-oculink-hotplug.sh
+# Run the installer from the directory containing these files
+chmod +x install-oculink-hotplug.sh
+sudo ./install-oculink-hotplug.sh
 ```
 
 ### Usage
