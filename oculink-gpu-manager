@@ -3,9 +3,10 @@
 # Handles safe GPU removal and addition
 
 LOGFILE="/var/log/oculink-gpu-manager.log"
-LOCKFILE="/tmp/oculink-gpu-removal.lock"
-DISPLAY_VAR="${DISPLAY:-:0}"
-USER_NAME="${SUDO_USER:-$(who | awk 'NR==1{print $1}')}"
+
+OCULINK_LIB="$(dirname -- "$(readlink -f -- "$0")")/oculink-common.sh"
+[ -r "$OCULINK_LIB" ] || OCULINK_LIB=/usr/local/lib/oculink/oculink-common.sh
+source "$OCULINK_LIB" || exit 1
 
 log_message() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOGFILE"
@@ -14,119 +15,174 @@ log_message() {
 send_notification() {
     local message="$1"
     local urgency="${2:-normal}"
-    
-    # Try to send notification to the active user
-    if [ -n "$USER_NAME" ]; then
-        sudo -u "$USER_NAME" DISPLAY="$DISPLAY_VAR" notify-send \
-            --urgency="$urgency" \
-            --app-name="OCuLink GPU Manager" \
-            "GPU Hot-plug" "$message" 2>/dev/null || true
-    fi
-    
+
+    notify_user "GPU Hot-plug" "$message" "$urgency" "OCuLink GPU Manager"
     log_message "NOTIFICATION: $message"
 }
 
+# Close the processes using the GPU (other than spared ones like the compositor)
 stop_gpu_processes() {
-    local pci_id="$1"
-    
-    log_message "Stopping GPU-intensive processes for $pci_id"
-    
-    # Kill GPU-intensive applications gracefully
-    pkill -f "blender" 2>/dev/null || true
-    pkill -f "davinci" 2>/dev/null || true  
-    pkill -f "steam" 2>/dev/null || true
-    pkill -f "lutris" 2>/dev/null || true
-    pkill -f "wine" 2>/dev/null || true
-    
-    # Stop compositor temporarily to release GPU
-    if pgrep -x "Hyprland" > /dev/null; then
-        log_message "Temporarily stopping Hyprland compositor"
-        sudo -u "$USER_NAME" DISPLAY="$DISPLAY_VAR" hyprctl dispatch exit &
-        sleep 2
-    fi
-    
-    # Unload GPU-specific modules if safe
-    if lsmod | grep -q "amdgpu"; then
-        sleep 3  # Allow processes to terminate
-        log_message "Attempting to unload amdgpu module"
-        modprobe -r amdgpu 2>/dev/null || log_message "Warning: Could not unload amdgpu module"
-    fi
+    local pci_id="$1" pid comm targets=() alive
+
+    log_message "Stopping processes using $pci_id"
+
+    for pid in $(oculink_gpu_pids "$pci_id"); do
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+        if oculink_is_spared "$pid" "$comm"; then
+            log_message "Leaving $comm ($pid) running"
+        else
+            log_message "Stopping $comm ($pid)"
+            targets+=("$pid")
+        fi
+    done
+    [ ${#targets[@]} -gt 0 ] || return 0
+
+    # Ask nicely, then force anything still running after 10 seconds
+    kill -TERM "${targets[@]}" 2>/dev/null
+    for _ in {1..20}; do
+        alive=()
+        for pid in "${targets[@]}"; do
+            kill -0 "$pid" 2>/dev/null && alive+=("$pid")
+        done
+        [ ${#alive[@]} -eq 0 ] && return 0
+        sleep 0.5
+    done
+    log_message "Force-killing processes that didn't exit: ${alive[*]}"
+    kill -KILL "${alive[@]}" 2>/dev/null
+    sleep 1
 }
 
 prepare_gpu_removal() {
     local pci_id="$1"
-    
+
     # Create lock to prevent multiple simultaneous removals
-    if [ -f "$LOCKFILE" ]; then
+    if [ -f "$OCULINK_LOCKFILE" ]; then
         log_message "GPU removal already in progress"
         return 1
     fi
-    
-    touch "$LOCKFILE"
-    
-    # Get GPU model info before removal for smart reconnection - only discrete GPUs
-    local gpu_model=$(lspci | grep -i "amd.*vga" | grep -v -i "hawkpoint\|radeon.*[0-9][0-9][0-9][0-9]G\|vega.*[0-9]" | head -1 | cut -d':' -f3- | xargs)
-    echo "$gpu_model" > /tmp/oculink-removed-gpu
-    
-    send_notification "Preparing GPU for safe removal..." "critical"
-    
-    stop_gpu_processes "$pci_id"
-    
-    # Echo to PCIe remove file to safely disconnect
-    local pci_path="/sys/bus/pci/devices/$pci_id"
-    if [ -f "$pci_path/remove" ]; then
-        log_message "Safely removing PCIe device $pci_id"
-        echo 1 > "$pci_path/remove" 2>/dev/null || log_message "Warning: Could not remove PCIe device"
+
+    # Work out what to remove before anything disappears from sysfs
+    local port
+    if ! port=$(oculink_card_port "$pci_id"); then
+        log_message "Could not find the PCIe port for $pci_id"
+        send_notification "Could not find the OCuLink port for the GPU" "critical"
+        return 1
     fi
-    
+    local gpu_model=$(list_oculink_gpus | grep -F "$pci_id" | cut -d' ' -f2-)
+
+    local displays
+    displays=$(oculink_gpu_displays "$pci_id" | tr '\n' ' ')
+    if [ -n "$displays" ] && [ "$OCULINK_FORCE_REMOVE" != "1" ]; then
+        log_message "Refusing removal: displays still attached to the GPU (${displays% })"
+        send_notification "Unplug the displays from the GPU first (${displays% })" "critical"
+        return 1
+    fi
+
+    touch "$OCULINK_LOCKFILE"
+    echo "$gpu_model" > "$OCULINK_REMOVED_GPU_FILE"
+    echo "$port" > "$OCULINK_REMOVED_PORT_FILE"
+
+    send_notification "Preparing GPU for safe removal..." "critical"
+
+    stop_gpu_processes "$pci_id"
+
+    # Keep the port powered so its link state stays readable while it's empty;
+    # runtime suspend would drop the link and look like an unplug
+    local port_path="/sys/bus/pci/devices/$port"
+    cat "$port_path/power/control" > "$OCULINK_PORT_POWER_FILE"
+    echo on > "$port_path/power/control"
+
+    # Remove the whole card (GPU, its audio function, and any bridges on it)
+    local dev
+    for dev in "$port_path"/0000:*; do
+        [ -e "$dev/remove" ] || continue
+        log_message "Safely removing PCIe device ${dev##*/} (and anything below it)"
+        echo 1 > "$dev/remove" 2>/dev/null || log_message "Warning: Could not remove PCIe device ${dev##*/}"
+    done
+
     send_notification "GPU is now safe to unplug!" "normal"
-    
+
     # Start Stage 1: Wait for actual removal, then trigger Stage 2 reconnection monitoring
     log_message "Starting two-stage monitoring: Stage 1 - Removal verification"
-    /usr/local/bin/oculink-removal-watcher "$gpu_model" &
-    
+    systemd-run --quiet --collect --unit="$OCULINK_REMOVAL_UNIT" \
+        "$OCULINK_BIN_DIR/oculink-removal-watcher" "$gpu_model" "$port" \
+        || log_message "Warning: Could not start removal watcher"
+
     # Note: Lock will be removed by removal watcher once GPU is actually unplugged
 }
 
 handle_gpu_addition() {
     local pci_id="$1"
-    
+
     log_message "GPU added: $pci_id"
-    send_notification "OCuLink GPU detected and ready!" "normal"
-    
+
+    # Reconnections we drive ourselves (removal state still present) send their own notification
+    if [ ! -f "$OCULINK_REMOVED_PORT_FILE" ]; then
+        send_notification "OCuLink GPU detected and ready!" "normal"
+    fi
+
     # Reload amdgpu if needed
     if ! lsmod | grep -q "amdgpu"; then
         log_message "Loading amdgpu module"
         modprobe amdgpu 2>/dev/null || log_message "Warning: Could not load amdgpu module"
     fi
-    
-    # Restart compositor if it was stopped
-    if [ -n "$USER_NAME" ] && ! pgrep -x "Hyprland" > /dev/null; then
-        log_message "Restarting Hyprland compositor"
-        sudo -u "$USER_NAME" setsid Hyprland > /dev/null 2>&1 &
+}
+
+# udev events: the rules match every display-class PCI device, so filter down to
+# the configured GPU here. Prefer the event's env over sysfs.
+is_target_device() {
+    if [ -n "$PCI_ID" ] && [ -n "$PCI_CLASS" ]; then
+        is_oculink_gpu_id "${PCI_ID%%:*}" "${PCI_ID##*:}" "$PCI_CLASS"
+    else
+        is_oculink_gpu "$1"
     fi
 }
 
 case "$1" in
     add)
+        is_target_device "$2" || exit 0
         handle_gpu_addition "$2"
-        ;;
-    remove|unbind)
-        prepare_gpu_removal "$2"
         ;;
     manual-safe-remove)
         # Manual trigger for safe removal
         send_notification "Initiating manual GPU safe removal..." "critical"
-        # Find discrete AMD GPU PCI ID - exclude integrated
-        gpu_pci=$(lspci -D | grep -i "amd.*vga" | grep -v -i "hawkpoint\|radeon.*[0-9][0-9][0-9][0-9]G\|vega.*[0-9]" | head -1 | cut -d' ' -f1 | tr ':.' '_')
+        gpu_pci=$(find_oculink_gpus | head -1)
         if [ -n "$gpu_pci" ]; then
-            prepare_gpu_removal "$gpu_pci"
+            prepare_gpu_removal "$gpu_pci" || exit 1
         else
-            send_notification "No AMD GPU found for removal" "normal"
+            send_notification "No OCuLink GPU found for removal" "normal"
+            exit 1
+        fi
+        ;;
+    status)
+        # Diagnostics: what would be removed, and whether unplugs are detectable
+        gpu_pci=$(find_oculink_gpus | head -1)
+        if [ -n "$gpu_pci" ]; then
+            echo "GPU:  $(list_oculink_gpus | head -1)"
+            port=$(oculink_card_port "$gpu_pci")
+        else
+            echo "GPU:  not on the bus"
+            port=$(cat "$OCULINK_REMOVED_PORT_FILE" 2>/dev/null)
+        fi
+        if [ -z "$port" ]; then
+            echo "Port: unknown"
+            exit 1
+        fi
+        echo "Port: $port"
+        echo "Link: $(oculink_link_up "$port" && echo up || echo down) (via $(oculink_link_method "$port"), width $(cat "/sys/bus/pci/devices/$port/current_link_width"))"
+        echo "Removal state: $([ -f "$OCULINK_REMOVED_PORT_FILE" ] && echo "GPU removed from port $(cat "$OCULINK_REMOVED_PORT_FILE")" || echo none)"
+        if [ -n "$gpu_pci" ]; then
+            displays=$(oculink_gpu_displays "$gpu_pci" | tr '\n' ' ')
+            echo "Displays attached: ${displays:-none} $([ -n "$displays" ] && echo "(unplug before removal)")"
+            echo "Processes using the GPU:"
+            for pid in $(oculink_gpu_pids "$gpu_pci"); do
+                comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+                echo "  $pid $comm$(oculink_is_spared "$pid" "$comm" && echo " (spared)")"
+            done
         fi
         ;;
     *)
-        echo "Usage: $0 {add|remove|unbind|manual-safe-remove} [pci_id]"
+        echo "Usage: $0 {add|manual-safe-remove|status} [pci_id]"
         exit 1
         ;;
 esac

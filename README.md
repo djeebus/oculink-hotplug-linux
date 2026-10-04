@@ -11,7 +11,7 @@ Safe hot-plugging system for OCuLink external GPUs on Linux, designed for device
 - **🛡️ Safe Removal** - Gracefully prepares GPU for disconnection
 - **🔄 Auto-Reconnection** - Detects and reinitializes GPU when reconnected
 - **🧠 Smart Detection** - Two-stage monitoring system
-- **⚡ Kernel Safety** - Configures kernel for surprise removal handling
+- **⚡ Fake Hotplug** - Watches the OCuLink port's link state, since OCuLink has no hotplug signalling
 - **🎮 Multi-GPU Support** - Safely handles systems with integrated + discrete GPUs
 - **📱 Desktop Integration** - Notifications and keyboard shortcuts
 
@@ -46,7 +46,7 @@ Press `SUPER + SHIFT + G` to toggle GPU removal/reconnection
 
 ### What Happens
 1. **Removal**: Safely prepares GPU → Waits for unplug → Monitors for reconnection
-2. **Reconnection**: Detects GPU → Loads drivers → Restarts display → Ready!
+2. **Reconnection**: Detects the link coming back → Rescans the port → Ready!
 
 ## 🔧 System Requirements
 

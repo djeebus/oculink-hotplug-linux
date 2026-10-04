@@ -9,8 +9,6 @@ ExecStart=/usr/local/bin/oculink-gpu-watcher
 Restart=always
 RestartSec=5
 User=root
-Environment="DISPLAY=:0"
-Environment="CHECK_INTERVAL=5"
 
 [Install]
 WantedBy=multi-user.target

@@ -1,14 +1,21 @@
 #!/bin/bash
 # OCuLink GPU Toggle Tool - Safe removal and reconnection
 
-LOCKFILE="/tmp/oculink-gpu-removal.lock"
+# Removing/rescanning PCI devices needs root
+if [ "$EUID" -ne 0 ]; then
+    exec sudo "$0" "$@"
+fi
+
+OCULINK_LIB="$(dirname -- "$(readlink -f -- "$0")")/oculink-common.sh"
+[ -r "$OCULINK_LIB" ] || OCULINK_LIB=/usr/local/lib/oculink/oculink-common.sh
+source "$OCULINK_LIB" || exit 1
 
 send_notification() {
     local title="$1"
     local message="$2"
     local urgency="${3:-normal}"
-    
-    notify-send --urgency="$urgency" --app-name="OCuLink GPU" "$title" "$message" 2>/dev/null || true
+
+    notify_user "$title" "$message" "$urgency"
     echo "🔔 $title: $message"
 }
 
@@ -16,8 +23,8 @@ echo "🔌 OCuLink GPU Toggle Tool"
 echo "=========================="
 
 # Check monitor status
-monitor_status=$(/usr/local/bin/oculink-reconnect-monitor status 2>/dev/null || echo "INACTIVE")
-removal_watcher_active=$([ -f "/tmp/oculink-removal-watcher.pid" ] && echo "ACTIVE" || echo "INACTIVE")
+monitor_status=$("$OCULINK_BIN_DIR/oculink-reconnect-monitor" status 2>/dev/null || echo "INACTIVE")
+removal_watcher_active=$(systemctl is-active --quiet "$OCULINK_REMOVAL_UNIT" && echo "ACTIVE" || echo "INACTIVE")
 
 if [[ "$removal_watcher_active" == "ACTIVE" ]]; then
     echo "👀 Stage 1: Waiting for physical GPU removal..."
@@ -30,120 +37,124 @@ fi
 
 echo
 
-# Check if removal is in progress
-if [ -f "$LOCKFILE" ] || [[ "$removal_watcher_active" == "ACTIVE" ]]; then
-    send_notification "GPU Ready" "OCuLink GPU is safe to unplug now!" "critical"
+# Check if removal is in progress (GPU detached but still plugged in)
+if [ -f "$OCULINK_LOCKFILE" ] || [[ "$removal_watcher_active" == "ACTIVE" ]]; then
     echo "🔄 GPU removal in progress..."
     echo "   GPU should be safe to unplug now!"
     echo
-    read -p "📌 Cancel removal and clear state? [y/N]: " -n 1 -r
+    read -p "📌 Cancel removal and restore GPU? [y/N]: " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        # Clean up all removal-related processes and files
-        rm -f "$LOCKFILE"
-        
-        # Kill removal watcher if active
-        if [ -f "/tmp/oculink-removal-watcher.pid" ]; then
-            local watcher_pid=$(cat /tmp/oculink-removal-watcher.pid 2>/dev/null || echo "")
-            if [ -n "$watcher_pid" ]; then
-                kill "$watcher_pid" 2>/dev/null || true
-            fi
-            rm -f /tmp/oculink-removal-watcher.pid
+        systemctl stop "$OCULINK_REMOVAL_UNIT" 2>/dev/null
+        "$OCULINK_BIN_DIR/oculink-reconnect-monitor" stop
+
+        if oculink_rescan; then
+            send_notification "Cancelled" "GPU removal cancelled - GPU restored" "normal"
+            echo "✅ Removal cancelled and GPU restored."
+        else
+            send_notification "Cancelled" "GPU removal cancelled, but the GPU did not come back - check connection" "critical"
+            echo "⚠️  Removal cancelled, but the GPU did not come back."
         fi
-        
-        # Stop reconnection monitor if active
-        /usr/local/bin/oculink-reconnect-monitor stop 2>/dev/null || true
-        
-        send_notification "Cancelled" "GPU removal cancelled - all monitoring stopped" "normal"
-        echo "✅ Removal cancelled and state cleared."
+        oculink_clear_removal_state
     fi
     exit 0
 fi
 
-# Check if GPU is present - ONLY discrete OCuLink GPUs, exclude integrated
-gpu_count=$(lspci | grep -i "amd.*vga" | grep -v -i "hawkpoint\|radeon.*[0-9][0-9][0-9][0-9]G\|vega.*[0-9]" | wc -l)
-discrete_gpu=$(lspci | grep -i "amd.*vga" | grep -v -i "hawkpoint\|radeon.*[0-9][0-9][0-9][0-9]G\|vega.*[0-9]" | head -1)
+# Check if the OCuLink GPU (as defined in the GPU config) is present
+discrete_gpu=$(list_oculink_gpus | head -1)
 
-if [ "$gpu_count" -gt 0 ] && [ -n "$discrete_gpu" ]; then
+if [ -n "$discrete_gpu" ]; then
     # GPU present - offer removal
-    send_notification "GPU Detected" "OCuLink GPU found - preparing for safe removal" "normal"
     echo "🔍 Detected discrete GPU:"
     echo "   $discrete_gpu"
     echo
+
+    # Show what removal will do to running programs
+    stopping=()
+    sparing=()
+    for pid in $(oculink_gpu_pids "${discrete_gpu%% *}"); do
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+        if oculink_is_spared "$pid" "$comm"; then
+            sparing+=("$comm ($pid)")
+        else
+            stopping+=("$comm ($pid)")
+        fi
+    done
+    if [ ${#stopping[@]} -gt 0 ]; then
+        echo "🛑 These programs are using the GPU and will be closed:"
+        printf '   • %s\n' "${stopping[@]}"
+        echo
+    fi
+    if [ ${#sparing[@]} -gt 0 ]; then
+        echo "🖥️  These will keep running, but lose access to the GPU (and its displays):"
+        printf '   • %s\n' "${sparing[@]}"
+        echo
+    fi
+
     read -p "⚠️  Safely prepare GPU for removal? [y/N]: " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        send_notification "Cancelled" "GPU removal cancelled by user" "normal"
         echo "❌ Cancelled."
         exit 0
     fi
-    
-    send_notification "Preparing Removal" "Stopping processes and unloading drivers..." "critical"
+
+    # Removing the GPU with displays attached (especially DP MST hubs and
+    # daisy chains) can panic the kernel, so wait for them to be unplugged
+    displays=$(oculink_gpu_displays "${discrete_gpu%% *}")
+    if [ -n "$displays" ]; then
+        echo "🖥️  Unplug these displays from the GPU first (removing the GPU with displays"
+        echo "   attached can crash the kernel):"
+        printf '   • %s\n' $displays
+        echo "   Waiting for them to disconnect... (Ctrl+C to cancel)"
+        while [ -n "$(oculink_gpu_displays "${discrete_gpu%% *}")" ]; do
+            sleep 1
+        done
+        echo "✅ Displays disconnected."
+        # Let amdgpu finish tearing down the outputs (and any MST topology)
+        sleep 2
+        echo
+    fi
+
     echo "🔄 Preparing GPU for safe removal..."
-    echo "   • Stopping GPU-intensive processes"
-    echo "   • Unloading drivers"  
+    echo "   • Closing programs using the GPU"
     echo "   • Disconnecting PCIe device"
     echo
-    
+
     # Call the manager script
-    /usr/local/bin/oculink-gpu-manager manual-safe-remove
-    
-    send_notification "Safe to Unplug!" "OCuLink GPU is now safe to remove" "critical"
-    echo "✅ GPU is now safe to unplug!"
-    echo "   You should see a notification when ready."
-    
-elif [ "$gpu_count" -eq 0 ]; then
+    if "$OCULINK_BIN_DIR/oculink-gpu-manager" manual-safe-remove; then
+        echo "✅ GPU is now safe to unplug!"
+        echo "   You'll get a notification once it's unplugged, and again when it's reconnected."
+    else
+        echo "❌ GPU removal failed - see /var/log/oculink-gpu-manager.log"
+        exit 1
+    fi
+
+else
     # No discrete GPU - trigger rescan for reconnection
-    send_notification "Scanning..." "Looking for reconnected OCuLink GPU" "normal"
+    send_notification "Scanning..." "Looking for reconnected OCuLink GPU"
     echo "🔍 Only integrated GPU detected."
     echo "   Scanning for reconnected OCuLink GPU..."
     echo
-    
-    # Rescan PCI bus
-    echo 1 > /sys/bus/pci/rescan 2>/dev/null || {
-        send_notification "Permission Error" "Need root access for PCI rescan" "critical"
-        echo "⚠️  Need root permissions for PCI rescan"
-        echo "   Run: sudo sh -c 'echo 1 > /sys/bus/pci/rescan'"
-        exit 1
-    }
-    
-    sleep 2
-    
-    # Check if GPU reappeared - only discrete GPUs
-    new_gpu=$(lspci | grep -i "amd.*vga" | grep -v -i "hawkpoint\|radeon.*[0-9][0-9][0-9][0-9]G\|vega.*[0-9]")
-    if [ -n "$new_gpu" ]; then
-        send_notification "GPU Connected!" "OCuLink GPU detected and initializing..." "normal"
-        echo "✅ OCuLink GPU reconnected!"
-        echo "   $new_gpu"
-        
-        # Reload driver if needed
+
+    if oculink_rescan; then
+        "$OCULINK_BIN_DIR/oculink-reconnect-monitor" stop
+        oculink_clear_removal_state
+
+        # Load the driver if needed
         if ! lsmod | grep -q "amdgpu"; then
-            send_notification "Loading Driver" "Initializing GPU driver..." "normal"
             echo "🔄 Loading GPU driver..."
             modprobe amdgpu 2>/dev/null || {
                 send_notification "Driver Error" "Could not load amdgpu driver" "critical"
                 echo "⚠️  Could not load amdgpu driver"
             }
         fi
-        
-        # Restart compositor if needed
-        if ! pgrep -x "Hyprland" > /dev/null; then
-            send_notification "Restarting Display" "Restarting Hyprland compositor..." "normal"
-            echo "🔄 Restarting Hyprland..."
-            setsid Hyprland > /dev/null 2>&1 &
-        fi
-        
-        # Final success notification
-        send_notification "GPU Ready!" "OCuLink GPU is ready to use!" "normal"
-        
+
+        echo "✅ OCuLink GPU reconnected!"
+        echo "   $(list_oculink_gpus | head -1)"
+        send_notification "GPU Ready!" "OCuLink GPU is ready to use!"
     else
         send_notification "GPU Not Found" "No OCuLink GPU detected - check connection" "critical"
         echo "❌ No OCuLink GPU detected."
         echo "   Make sure GPU is properly connected."
     fi
-    
-else
-    send_notification "No GPU Found" "Connect your OCuLink GPU and try again" "normal"
-    echo "❌ No AMD GPU detected."
-    echo "   Connect your OCuLink GPU and try again."
 fi

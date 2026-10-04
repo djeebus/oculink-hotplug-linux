@@ -1,10 +1,21 @@
 #!/bin/bash
 # OCuLink GPU Removal Verification Watcher
 # Stage 1: Monitors for actual physical removal, then triggers reconnection monitoring
+#
+# The GPU has already been removed from the PCI bus in software, so it can't be
+# watched directly. Instead, watch the link on the port it was plugged into:
+# it stays up until the cable is pulled.
+#
+# Runs as a transient systemd unit (see oculink-gpu-manager).
 
 GPU_MODEL="$1"
+PORT="$2"
 REMOVAL_TIMEOUT=300  # 5 minutes to actually remove the GPU
 LOG_FILE="/var/log/oculink-removal-watcher.log"
+
+OCULINK_LIB="$(dirname -- "$(readlink -f -- "$0")")/oculink-common.sh"
+[ -r "$OCULINK_LIB" ] || OCULINK_LIB=/usr/local/lib/oculink/oculink-common.sh
+source "$OCULINK_LIB" || exit 1
 
 log_message() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
@@ -12,89 +23,76 @@ log_message() {
 
 send_notification() {
     local title="$1"
-    local message="$2" 
+    local message="$2"
     local urgency="${3:-normal}"
-    
-    # Find active user session
-    local active_user=$(who | awk 'NR==1{print $1}')
-    if [ -n "$active_user" ]; then
-        sudo -u "$active_user" DISPLAY=:0 notify-send \
-            --urgency="$urgency" \
-            --app-name="OCuLink Removal Watcher" \
-            "$title" "$message" 2>/dev/null || true
-    fi
-    
+
+    notify_user "$title" "$message" "$urgency" "OCuLink Removal Watcher"
     log_message "NOTIFICATION: $title - $message"
 }
 
 wait_for_actual_removal() {
     local gpu_model="$1"
+    local port="$2"
     local start_time=$(date +%s)
-    
-    log_message "Stage 1: Waiting for actual removal of GPU: $gpu_model"
+    local down_count=0
+
+    log_message "Stage 1: Waiting for actual removal of GPU: $gpu_model (port $port)"
     send_notification "Waiting for Removal" "GPU prepared - unplug when ready" "normal"
-    
-    # Keep checking until GPU actually disappears from lspci
+
     while true; do
         local current_time=$(date +%s)
         local elapsed=$((current_time - start_time))
-        
-        # Check if GPU is still present - only discrete GPUs
-        local gpu_present=$(lspci | grep -i "amd.*vga" | grep -v -i "hawkpoint\|radeon.*[0-9][0-9][0-9][0-9]G\|vega.*[0-9]" | grep -c "$gpu_model" || echo "0")
-        
-        if [ "$gpu_present" -eq 0 ]; then
+
+        # Require two readings in a row so a link retrain doesn't count as an unplug
+        if oculink_link_up "$port"; then
+            down_count=0
+        else
+            down_count=$((down_count + 1))
+        fi
+
+        if [ "$down_count" -ge 2 ]; then
             log_message "Stage 1 Complete: GPU physically removed - $gpu_model"
             send_notification "GPU Removed!" "Physical removal detected - monitoring for reconnection" "normal"
-            
-            # Now start Stage 2: Reconnection monitoring
+
+            # Now start Stage 2: Reconnection monitoring, as its own unit so it
+            # outlives this one
             log_message "Stage 2: Starting reconnection monitoring"
-            /usr/local/bin/oculink-reconnect-monitor start "$gpu_model" &
-            
-            # Clean up removal state files
-            rm -f /tmp/oculink-gpu-removal.lock
-            rm -f /tmp/oculink-removal-watcher.pid
-            
+            "$OCULINK_BIN_DIR/oculink-reconnect-monitor" start "$gpu_model" "$port"
+
+            # The GPU is gone, so a new removal can't conflict with this one
+            rm -f "$OCULINK_LOCKFILE"
             exit 0
         fi
-        
+
         # Timeout check
         if [ $elapsed -gt $REMOVAL_TIMEOUT ]; then
-            log_message "Timeout: GPU not removed within $REMOVAL_TIMEOUT seconds"
-            send_notification "Removal Timeout" "GPU still connected after 5 minutes - cancelling monitoring" "critical"
-            
-            # Clean up and exit
-            rm -f /tmp/oculink-gpu-removal.lock
-            rm -f /tmp/oculink-removal-watcher.pid
+            log_message "Timeout: GPU not removed within $REMOVAL_TIMEOUT seconds - restoring it"
+
+            # It's still plugged in, so bring it back rather than leave it detached
+            if oculink_rescan; then
+                send_notification "Removal Timeout" "GPU wasn't unplugged within 5 minutes - it has been restored" "critical"
+            else
+                send_notification "Removal Timeout" "GPU wasn't unplugged within 5 minutes, and could not be restored - run gpu-safe-remove" "critical"
+            fi
+            oculink_clear_removal_state
             exit 1
         fi
-        
-        # Send periodic reminders
-        if [ $((elapsed % 60)) -eq 0 ] && [ $elapsed -gt 0 ]; then
+
+        # Send periodic reminders (elapsed advances in 2s steps, so check the window)
+        if [ $elapsed -gt 0 ] && [ $((elapsed % 60)) -lt 2 ]; then
             local minutes=$((elapsed / 60))
             send_notification "Still Waiting" "GPU ready for removal (${minutes}m elapsed)" "low"
         fi
-        
-        sleep 3  # Check every 3 seconds
+
+        sleep 2
     done
 }
 
-# Handle signals for clean shutdown
-cleanup() {
-    log_message "Removal watcher shutting down"
-    rm -f /tmp/oculink-removal-watcher.pid
-    exit 0
-}
-
-trap cleanup EXIT INT TERM
-
-# Save PID for tracking
-echo $$ > /tmp/oculink-removal-watcher.pid
-
 # Main execution
-if [ -z "$GPU_MODEL" ]; then
-    echo "Usage: $0 <gpu_model>"
+if [ -z "$GPU_MODEL" ] || [ -z "$PORT" ]; then
+    echo "Usage: $0 <gpu_model> <pci_port>"
     exit 1
 fi
 
 log_message "Starting removal watcher for: $GPU_MODEL"
-wait_for_actual_removal "$GPU_MODEL"
+wait_for_actual_removal "$GPU_MODEL" "$PORT"

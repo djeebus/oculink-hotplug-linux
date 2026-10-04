@@ -25,6 +25,8 @@ BIN_FILES=(
     oculink-kernel-config
     gpu-safe-remove
 )
+LIB_FILES=(oculink-common.sh)
+CONF_FILES=(oculink-gpu.conf)
 UDEV_FILES=(99-oculink-gpu-hotplug.rules)
 SERVICE_FILES=(
     oculink-gpu-monitor.service
@@ -33,7 +35,7 @@ SERVICE_FILES=(
 
 # Make sure everything we need is present before touching the system
 missing=()
-for f in "${BIN_FILES[@]}" "${UDEV_FILES[@]}" "${SERVICE_FILES[@]}"; do
+for f in "${BIN_FILES[@]}" "${LIB_FILES[@]}" "${CONF_FILES[@]}" "${UDEV_FILES[@]}" "${SERVICE_FILES[@]}"; do
     [ -f "$SCRIPT_DIR/$f" ] || missing+=("$f")
 done
 if [ ${#missing[@]} -ne 0 ]; then
@@ -47,6 +49,15 @@ echo "📁 Installing files from $SCRIPT_DIR..."
 # Install scripts
 for f in "${BIN_FILES[@]}"; do
     install -m 755 "$SCRIPT_DIR/$f" /usr/local/bin/
+done
+
+# Install shared helpers and GPU config
+install -d /usr/local/lib/oculink
+for f in "${LIB_FILES[@]}"; do
+    install -m 644 "$SCRIPT_DIR/$f" /usr/local/lib/oculink/
+done
+for f in "${CONF_FILES[@]}"; do
+    install -m 644 "$SCRIPT_DIR/$f" /etc/
 done
 
 # Install udev rules
@@ -89,6 +100,7 @@ echo "   • Manual: Run 'gpu-safe-remove' before unplugging"
 echo "   • Smart reconnection: Auto-detects when you plug it back in"
 echo "   • Logs: Check /var/log/oculink-*.log for details"
 echo "   • Monitor status: 'oculink-reconnect-monitor status'"
+echo "   • GPU matching (vendor/class/device IDs): /etc/oculink-gpu.conf"
 echo
 echo "🔍 Service status:"
 systemctl status oculink-gpu-monitor.service --no-pager -l
@@ -96,5 +108,5 @@ systemctl status oculink-gpu-monitor.service --no-pager -l
 echo
 echo "⚠️  Important notes:"
 echo "   • Always wait for the 'safe to unplug' notification"
-echo "   • The system may temporarily restart your compositor"
-echo "   • GPU-intensive apps will be closed during removal"
+echo "   • Programs using the eGPU are closed during removal (your compositor is not)"
+echo "   • Check link detection with: sudo oculink-gpu-manager status"

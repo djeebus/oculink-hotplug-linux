@@ -23,7 +23,11 @@ sudo cp oculink-removal-watcher /usr/local/bin/
 sudo cp oculink-kernel-config /usr/local/bin/
 sudo chmod +x /usr/local/bin/oculink-*
 sudo chmod +x /usr/local/bin/gpu-safe-remove
+sudo install -D -m 644 oculink-common.sh /usr/local/lib/oculink/oculink-common.sh
+sudo install -m 644 oculink-gpu.conf /etc/
 ```
+
+Edit `oculink-gpu.conf` to change which PCI vendor/class/device IDs are treated as the OCuLink GPU.
 
 ### 2. Install udev Rules
 ```bash
@@ -72,6 +76,8 @@ sudo systemctl disable oculink-gpu-monitor oculink-kernel-safety
 
 # Remove files
 sudo rm -f /usr/local/bin/{gpu-safe-remove,oculink-*}
+sudo rm -rf /usr/local/lib/oculink
+sudo rm -f /etc/oculink-gpu.conf
 sudo rm -f /etc/udev/rules.d/99-oculink-gpu-hotplug.rules
 sudo rm -f /etc/systemd/system/oculink-*.service
 

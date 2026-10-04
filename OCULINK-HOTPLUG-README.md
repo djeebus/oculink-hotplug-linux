@@ -36,35 +36,36 @@ sudo ./install-oculink-hotplug.sh
 
 #### 2. **oculink-gpu-manager** (Core Manager)
 - Handles the actual GPU preparation process
-- Stops GPU processes
-- Unloads drivers
-- Manages PCIe disconnection
+- Closes programs holding the GPU's `/dev/dri` nodes open (compositors are spared; see `GPU_SPARE_PROCESSES`)
+- Removes the whole card (GPU, HDMI audio, and the card's internal PCIe switch) from the bus, leaving `amdgpu` loaded for the iGPU
 - Triggers monitoring stages
+- `oculink-gpu-manager status` shows the GPU, its port, link state, and which programs would be closed
+
+OCuLink ports have no hotplug signalling, so the kernel never notices the cable
+being pulled or plugged back in. Both stages instead poll the link state of the
+PCIe port the card hangs off (the Data Link Layer Link Active bit, or the link
+width if the port can't report that), and run as transient systemd units so
+they outlive the command that started them.
 
 #### 3. **oculink-removal-watcher** (Stage 1 Monitor)
-- Waits for physical GPU removal
-- Monitors `lspci` to detect when GPU disappears
+- Waits for physical GPU removal by watching the port's link go down
 - Only starts Stage 2 after confirmed removal
-- 5-minute timeout with periodic notifications
+- 5-minute timeout with periodic notifications; on timeout the GPU is restored
 
 #### 4. **oculink-reconnect-monitor** (Stage 2 Monitor)
-- Monitors for GPU reconnection using udevadm
+- Watches the port's link come back up, then rescans just that port
 - Only activates after confirmed removal
 - Matches exact GPU model that was removed
-- Auto-reinitializes drivers and display
-- 10-minute timeout
+- 10-minute timeout (after that, run `gpu-safe-remove` to rescan)
 
-#### 5. **oculink-kernel-config** (Kernel Safety)
+#### 5. **oculink-kernel-config** (PCIe Configuration)
 - Runs at boot via systemd
-- Configures PCIe ports for hot-plug
-- Enables surprise removal handling
-- Sets AMDGPU driver resilience parameters
+- Enables runtime power management for the GPU
 - No bootloader modifications needed
 
 #### 6. **oculink-gpu-watcher** (Health Monitor)
-- Background service monitoring GPU health
-- Detects GPU errors in kernel log
-- Triggers emergency cleanup if needed
+- Follows the kernel log for errors from the OCuLink GPU
+- Notifies you (at most once a minute); doesn't remove the GPU itself
 
 ### Process Flow
 
@@ -74,20 +75,20 @@ User Action (SUPER+SHIFT+G)
 GPU Detection
     ├─ GPU Present → Offer Removal
     │   ├─ User Confirms
-    │   ├─ Stop Processes
-    │   ├─ Unload Drivers
-    │   ├─ Disconnect PCIe
+    │   ├─ Close Programs Using the GPU
+    │   ├─ Remove Card from PCIe Bus
     │   ├─ Start Stage 1 Monitor
-    │   │   ├─ Wait for Physical Removal
+    │   │   ├─ Wait for Port Link Down (Physical Removal)
     │   │   └─ When Removed → Start Stage 2
     │   └─ Stage 2 Monitor
-    │       ├─ Watch for Reconnection
-    │       ├─ Detect Same GPU Model
-    │       ├─ Reinitialize Drivers
-    │       └─ Restart Display
+    │       ├─ Wait for Port Link Up (Reconnection)
+    │       ├─ Rescan the Port
+    │       └─ Detect Same GPU Model
+    │
+    ├─ Removal In Progress → Offer to Cancel (Rescan to Restore GPU)
     │
     └─ GPU Absent → Scan for Reconnection
-        ├─ Rescan PCIe Bus
+        ├─ Rescan the Port (or Whole Bus)
         ├─ Detect GPU
         ├─ Load Drivers
         └─ Send Ready Notification
@@ -96,21 +97,17 @@ GPU Detection
 ## Safety Features
 
 ### Multi-GPU Protection
-- **Intelligent Detection**: Only targets discrete GPUs (RX 6000/7000 series)
-- **Excludes Integrated**: Never touches integrated GPUs (HawkPoint, Vega, etc.)
-- **Bus-Based Filtering**: Uses PCIe bus information for accurate targeting
+- **ID-Based Detection**: Matches the GPU by PCI vendor ID, class, and (optionally) device ID from `/etc/oculink-gpu.conf`
+- **Excludes Integrated**: AMD APU iGPUs that report the Display controller class (0380) are never matched; pin `GPU_DEVICE_IDS` if your iGPU uses VGA class 0300
 
-### Kernel-Level Safety
-- **PCIe Power Management**: Enables D3cold and ASPM
-- **Advanced Error Reporting**: PCIe AER catches disconnection events
-- **AMDGPU Recovery**: GPU recovery mode prevents system hangs
-- **Timeout Protection**: Driver timeouts prevent infinite waits
+### Removal Safety
+- **Targeted Process Cleanup**: Only programs with the eGPU open are closed (SIGTERM, then SIGKILL after 10s)
+- **Session Preserved**: The compositor keeps running; only the eGPU's displays go away
+- **Whole-Card Removal**: The GPU's audio function and bridges are removed too, so nothing is left attached when the cable is pulled
+- **Port Kept Powered**: Runtime PM is disabled on the port while it's empty so link state stays accurate, and restored on reconnect
+- **Error Monitoring**: Watches kernel log for errors from the eGPU
 
-### Surprise Removal Handling
-- **Automatic Cleanup**: Kills GPU processes on unexpected removal
-- **Memory Management**: Clears GPU memory allocations
-- **Error Monitoring**: Watches kernel log for PCIe errors
-- **Graceful Recovery**: System remains stable even on surprise unplug
+Unplugging without running `gpu-safe-remove` first is still a surprise removal, which this can't make safe.
 
 ## Configuration Files
 
@@ -124,8 +121,16 @@ GPU Detection
 ├── oculink-gpu-watcher       # Health monitor
 └── oculink-kernel-config     # Kernel configuration
 
+/usr/local/lib/oculink/
+└── oculink-common.sh         # Shared GPU detection helpers
+
+/etc/
+└── oculink-gpu.conf          # PCI vendor/class/device IDs to treat as the OCuLink GPU
+
 /etc/udev/rules.d/
-└── 99-oculink-gpu-hotplug.rules  # Udev rules for GPU events
+└── 99-oculink-gpu-hotplug.rules  # Runs the manager when the GPU appears after a rescan
+
+/run/oculink/                     # State while a removal is in progress (lock, port, GPU model)
 
 /etc/systemd/system/
 ├── oculink-gpu-monitor.service    # GPU health monitoring service
@@ -148,14 +153,14 @@ bind = $mainMod SHIFT, G, exec, ~/gpu-safe-remove  # OCuLink GPU toggle (remove/
 
 ### Check Current State
 ```bash
-# View removal watcher status
-[ -f "/tmp/oculink-removal-watcher.pid" ] && echo "Stage 1: Waiting for removal" || echo "Stage 1: Inactive"
+# GPU, port, link state, and removal state
+sudo oculink-gpu-manager status
 
-# View reconnection monitor status
-/usr/local/bin/oculink-reconnect-monitor status
+# View removal watcher (Stage 1) status
+systemctl status oculink-removal-watcher
 
-# Check if removal is in progress
-[ -f "/tmp/oculink-gpu-removal.lock" ] && echo "Removal in progress" || echo "No removal active"
+# View reconnection monitor (Stage 2) status
+oculink-reconnect-monitor status
 ```
 
 ### View Logs
@@ -173,24 +178,25 @@ dmesg | grep -i "pci\|amdgpu"
 ## Troubleshooting
 
 ### GPU Not Detected
-1. Check if GPU is visible: `lspci | grep -i vga`
-2. Verify it's not filtered as integrated: `lspci | grep -i "RX 6"`
+1. Check if GPU is visible, with IDs: `lspci -nn | grep -Ei 'vga|3d|display'`
+2. Compare its `[class]` and `[vendor:device]` against `/etc/oculink-gpu.conf`
 3. Check logs: `tail /var/log/oculink-gpu-manager.log`
 
 ### Removal Not Working
-1. Check for lock file: `ls -la /tmp/oculink-*.lock`
-2. Clear stuck state: `rm -f /tmp/oculink-*.lock /tmp/oculink-*.pid`
-3. Restart services: `sudo systemctl restart oculink-gpu-monitor`
+1. Check state: `sudo oculink-gpu-manager status`
+2. Cancel a stuck removal: run `gpu-safe-remove` and choose to cancel
+3. Check logs: `tail /var/log/oculink-gpu-manager.log /var/log/oculink-removal-watcher.log`
+
+### Unplug Not Detected
+Stage 1 relies on the port's link going down. With the GPU removed and the
+cable unplugged, `sudo oculink-gpu-manager status` should show `Link: down`.
+If it still shows `up`, your port doesn't report link state and the watcher
+will time out and restore the GPU after 5 minutes.
 
 ### Reconnection Not Detected
-1. Manual rescan: `echo 1 | sudo tee /sys/bus/pci/rescan`
-2. Check monitor status: `/usr/local/bin/oculink-reconnect-monitor status`
-3. Verify GPU model matches: `cat /tmp/oculink-removed-gpu`
-
-### System Hangs on Removal
-1. Kernel safety not active: `sudo systemctl status oculink-kernel-safety`
-2. Start kernel config: `sudo /usr/local/bin/oculink-kernel-config`
-3. Check AMDGPU parameters: `cat /sys/module/amdgpu/parameters/gpu_recovery`
+1. Run `gpu-safe-remove` again; with no GPU present it rescans
+2. Check monitor status: `oculink-reconnect-monitor status`
+3. Verify GPU model matches: `cat /run/oculink/removed-gpu`
 
 ## Advanced Usage
 
@@ -199,17 +205,14 @@ dmesg | grep -i "pci\|amdgpu"
 # Force safe removal (bypasses prompts)
 echo "y" | ~/gpu-safe-remove
 
-# Cancel removal in progress
-pkill -f oculink-removal-watcher
-rm -f /tmp/oculink-*.lock
+# Cancel removal in progress (restores the GPU)
+echo "y" | ~/gpu-safe-remove
 
 # Manually trigger reconnection scan
 sudo sh -c 'echo 1 > /sys/bus/pci/rescan'
 
 # Stop all monitoring
-sudo systemctl stop oculink-gpu-monitor
-pkill -f oculink-reconnect-monitor
-pkill -f oculink-removal-watcher
+sudo systemctl stop oculink-gpu-monitor oculink-removal-watcher oculink-reconnect-monitor
 ```
 
 ### Custom Hooks
@@ -227,7 +230,7 @@ Create scripts that run on GPU events:
 ### Tested Systems
 - **GPD Win Max 2**: Full compatibility with OCuLink port
 - **AMD GPUs**: RX 6000/7000 series
-- **Integrated GPUs**: Safely excluded (HawkPoint, Vega, etc.)
+- **Integrated GPUs**: Excluded via `/etc/oculink-gpu.conf` (Strix Point reports class 0380 and is skipped by default)
 
 ### Requirements
 - Linux kernel 5.10+ (PCIe hot-plug support)

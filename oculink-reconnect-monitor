@@ -1,11 +1,18 @@
 #!/bin/bash
 # Smart OCuLink GPU Reconnection Monitor
 # Only activates after a removal event, intelligently detects reconnection
+#
+# OCuLink has no hotplug signalling, so plugging the GPU back in doesn't
+# generate any events. Instead, watch the link on the port it was removed
+# from, and rescan that port once the link comes back up.
 
-MONITOR_STATE_FILE="/tmp/oculink-monitor-state"
-PCI_WATCH_PIPE="/tmp/oculink-pci-watch"
-REMOVED_GPU_INFO="/tmp/oculink-removed-gpu"
+MONITOR_STATE_FILE="/run/oculink/monitor-state"
+RECONNECT_TIMEOUT=600  # 10 minutes
 LOG_FILE="/var/log/oculink-reconnect.log"
+
+OCULINK_LIB="$(dirname -- "$(readlink -f -- "$0")")/oculink-common.sh"
+[ -r "$OCULINK_LIB" ] || OCULINK_LIB=/usr/local/lib/oculink/oculink-common.sh
+source "$OCULINK_LIB" || exit 1
 
 log_message() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
@@ -13,124 +20,77 @@ log_message() {
 
 send_notification() {
     local title="$1"
-    local message="$2" 
+    local message="$2"
     local urgency="${3:-normal}"
-    
-    # Find active user session
-    local active_user=$(who | awk 'NR==1{print $1}')
-    if [ -n "$active_user" ]; then
-        sudo -u "$active_user" DISPLAY=:0 notify-send \
-            --urgency="$urgency" \
-            --app-name="OCuLink Monitor" \
-            "$title" "$message" 2>/dev/null || true
-    fi
-    
+
+    notify_user "$title" "$message" "$urgency" "OCuLink Monitor"
     log_message "NOTIFICATION: $title - $message"
 }
 
+# Launch the monitor as its own systemd unit so it outlives whoever started it
 start_monitoring() {
     local removed_gpu_model="$1"
-    
-    log_message "Starting smart reconnection monitoring for: $removed_gpu_model"
-    send_notification "Monitoring Active" "Watching for OCuLink GPU reconnection..." "normal"
-    
-    # Save monitoring state
-    echo "ACTIVE|$removed_gpu_model|$(date +%s)" > "$MONITOR_STATE_FILE"
-    
-    # Create named pipe for PCI events if it doesn't exist
-    [ ! -p "$PCI_WATCH_PIPE" ] && mkfifo "$PCI_WATCH_PIPE"
-    
-    # Monitor PCI subsystem for changes (smart approach)
-    monitor_pci_events "$removed_gpu_model" &
-    local monitor_pid=$!
-    
-    # Set timeout (10 minutes)
-    (
-        sleep 600
-        if kill -0 $monitor_pid 2>/dev/null; then
-            log_message "Reconnection monitoring timeout reached"
-            send_notification "Monitor Timeout" "Stopped watching for GPU reconnection" "normal"
-            stop_monitoring
-            kill $monitor_pid 2>/dev/null
-        fi
-    ) &
+    local port="$2"
+
+    log_message "Starting smart reconnection monitoring for: $removed_gpu_model (port $port)"
+    systemd-run --quiet --collect --unit="$OCULINK_RECONNECT_UNIT" \
+        "$OCULINK_BIN_DIR/oculink-reconnect-monitor" run "$removed_gpu_model" "$port"
 }
 
-monitor_pci_events() {
+# The monitor itself (runs in the foreground inside the systemd unit)
+run_monitor() {
     local target_gpu="$1"
-    
-    # Use udevadm to monitor PCI events in real-time
-    udevadm monitor --subsystem-match=pci --property | while read line; do
-        if [[ "$line" == *"ACTION=add"* ]]; then
-            # Small delay to let device settle
-            sleep 2
-            
-            # Check if a matching GPU appeared - only discrete GPUs
-            local new_gpu=$(lspci | grep -i "amd.*vga" | grep -v -i "hawkpoint\|radeon.*[0-9][0-9][0-9][0-9]G\|vega.*[0-9]")
-            if [ -n "$new_gpu" ] && [[ "$new_gpu" == *"$target_gpu"* ]]; then
+    local port="$2"
+    local start_time=$(date +%s)
+    local up_count=0
+
+    send_notification "Monitoring Active" "Watching for OCuLink GPU reconnection..." "normal"
+    echo "ACTIVE|$target_gpu|$start_time" > "$MONITOR_STATE_FILE"
+    trap 'rm -f "$MONITOR_STATE_FILE"' EXIT
+
+    while true; do
+        # Require two readings in a row so the link has finished training
+        if oculink_link_up "$port"; then
+            up_count=$((up_count + 1))
+        else
+            up_count=0
+        fi
+
+        if [ "$up_count" -ge 2 ]; then
+            log_message "Link up on $port - rescanning"
+            oculink_rescan
+
+            local new_gpu=$(list_oculink_gpus | grep -F -- "$target_gpu" | head -1)
+            if [ -n "$new_gpu" ]; then
                 log_message "Target GPU reconnected: $new_gpu"
                 handle_reconnection "$new_gpu"
-                break
+                return 0
             fi
-        elif [[ "$line" == *"ACTION=remove"* ]]; then
-            # Reset monitoring if another removal detected
-            log_message "Another PCI removal detected during monitoring"
+
+            # Link is up but the card isn't answering yet; try again shortly
+            log_message "Link up but GPU not found after rescan, retrying"
+            up_count=0
         fi
+
+        if [ $(( $(date +%s) - start_time )) -gt $RECONNECT_TIMEOUT ]; then
+            log_message "Reconnection monitoring timeout reached"
+            send_notification "Monitor Timeout" "Stopped watching for GPU reconnection - run gpu-safe-remove after plugging it in" "normal"
+            return 1
+        fi
+
+        sleep 2
     done
 }
 
 handle_reconnection() {
     local gpu_info="$1"
-    
+
     log_message "Handling GPU reconnection: $gpu_info"
     send_notification "GPU Detected!" "OCuLink GPU reconnected - initializing..." "normal"
-    
-    # Wait for system stability
-    sleep 3
-    
-    # Verify GPU is actually accessible
-    if ! lspci -s $(echo "$gpu_info" | cut -d' ' -f1) &>/dev/null; then
-        log_message "GPU not accessible yet, waiting..."
-        sleep 5
-    fi
-    
-    # Check if we're in a good state to reinitialize
-    if check_system_ready; then
-        reinitialize_gpu "$gpu_info"
-        stop_monitoring
-    else
-        log_message "System not ready for GPU initialization, will retry..."
-        # Continue monitoring for better timing
-    fi
-}
 
-check_system_ready() {
-    # Don't reinitialize during suspend/resume
-    if [ -f "/sys/power/state" ]; then
-        local power_state=$(cat /sys/power/state 2>/dev/null | grep -o "mem" || true)
-        if [ -n "$power_state" ]; then
-            # Check if we're not in middle of suspend/resume cycle
-            if ! systemctl is-active --quiet systemd-suspend.target; then
-                return 0
-            fi
-        fi
-    fi
-    
-    # Check if display server is running and stable
-    if pgrep -x "Hyprland" > /dev/null || pgrep -x "Xorg" > /dev/null; then
-        # Wait a moment for stability
-        sleep 2
-        return 0
-    fi
-    
-    return 1
-}
+    # Back to normal: restore the port's power management, clear removal state
+    oculink_clear_removal_state
 
-reinitialize_gpu() {
-    local gpu_info="$1"
-    
-    send_notification "Initializing GPU" "Loading drivers and restarting display..." "normal"
-    
     # Load amdgpu driver if needed
     if ! lsmod | grep -q "amdgpu"; then
         log_message "Loading amdgpu driver"
@@ -139,79 +99,56 @@ reinitialize_gpu() {
             return 1
         }
     fi
-    
+
     # Give driver time to initialize
     sleep 3
-    
-    # Restart display server if needed (be more conservative)
-    local active_user=$(who | awk 'NR==1{print $1}')
-    if [ -n "$active_user" ]; then
-        # Only restart if no critical processes are running
-        if ! pgrep -f "firefox\|chrome\|code\|steam" >/dev/null; then
-            if ! pgrep -x "Hyprland" >/dev/null; then
-                log_message "Restarting Hyprland compositor"
-                sudo -u "$active_user" setsid Hyprland >/dev/null 2>&1 &
-                sleep 2
-            fi
-        else
-            log_message "Skipping display restart - critical applications running"
-        fi
-    fi
-    
+
     # Verify GPU is working
-    sleep 2
-    if lspci -s $(echo "$gpu_info" | cut -d' ' -f1) &>/dev/null; then
+    if [ -n "$(lspci -s "${gpu_info%% *}" 2>/dev/null)" ]; then
         send_notification "GPU Ready!" "OCuLink GPU successfully reconnected and ready!" "normal"
         log_message "GPU reconnection completed successfully"
-        
+
         # Optional: trigger any custom post-reconnection scripts
-        if [ -x "/home/$active_user/.config/scripts/gpu-reconnected.sh" ]; then
-            sudo -u "$active_user" "/home/$active_user/.config/scripts/gpu-reconnected.sh" &
+        local active_user=$(oculink_desktop_user)
+        if [ -n "$active_user" ] && [ -x "/home/$active_user/.config/scripts/gpu-reconnected.sh" ]; then
+            runuser -u "$active_user" -- "/home/$active_user/.config/scripts/gpu-reconnected.sh"
         fi
     else
         send_notification "Reconnection Failed" "GPU detected but not fully functional" "critical"
     fi
 }
 
-stop_monitoring() {
-    log_message "Stopping reconnection monitoring"
-    rm -f "$MONITOR_STATE_FILE" "$REMOVED_GPU_INFO"
-    
-    # Clean up pipe
-    if [ -p "$PCI_WATCH_PIPE" ]; then
-        rm -f "$PCI_WATCH_PIPE"
-    fi
-    
-    # Kill any remaining monitor processes
-    pkill -f "monitor_pci_events" 2>/dev/null || true
-}
-
-# Handle signals for clean shutdown
-trap stop_monitoring EXIT INT TERM
-
 # Main execution
 case "$1" in
     start)
-        if [ -f "$MONITOR_STATE_FILE" ]; then
+        if systemctl is-active --quiet "$OCULINK_RECONNECT_UNIT"; then
             log_message "Monitor already active"
             exit 0
         fi
-        
-        gpu_model="${2:-Unknown GPU}"
-        start_monitoring "$gpu_model"
+        if [ -z "$3" ]; then
+            echo "Usage: $0 start <gpu_model> <pci_port>"
+            exit 1
+        fi
+        start_monitoring "$2" "$3"
+        ;;
+    run)
+        run_monitor "$2" "$3"
         ;;
     stop)
-        stop_monitoring
+        if systemctl is-active --quiet "$OCULINK_RECONNECT_UNIT"; then
+            log_message "Stopping reconnection monitoring"
+            systemctl stop "$OCULINK_RECONNECT_UNIT"
+        fi
         ;;
     status)
-        if [ -f "$MONITOR_STATE_FILE" ]; then
+        if systemctl is-active --quiet "$OCULINK_RECONNECT_UNIT" && [ -f "$MONITOR_STATE_FILE" ]; then
             cat "$MONITOR_STATE_FILE"
         else
             echo "INACTIVE"
         fi
         ;;
     *)
-        echo "Usage: $0 {start|stop|status} [gpu_model]"
+        echo "Usage: $0 {start|stop|status} [gpu_model] [pci_port]"
         exit 1
         ;;
 esac

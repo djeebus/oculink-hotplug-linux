@@ -1,9 +1,9 @@
-# OCuLink GPU Hot-plug Safety Rules
-# Detect GPU addition
-SUBSYSTEM=="pci", DRIVER=="amdgpu", ACTION=="add", ENV{ID_PCI_CLASS_FROM_DATABASE}=="Display controller", RUN+="/usr/local/bin/oculink-gpu-manager add %k"
+# OCuLink GPU Hot-plug Rules
+# Matches every display-class (03xxxx) PCI device; oculink-gpu-manager filters
+# down to the GPU configured in /etc/oculink-gpu.conf.
+#
+# OCuLink has no hotplug signalling, so this only fires when the device shows
+# up via a PCI rescan (which the reconnect monitor and gpu-safe-remove do).
+# Removal is driven by gpu-safe-remove rather than udev.
 
-# Detect GPU removal preparation
-SUBSYSTEM=="pci", DRIVER=="amdgpu", ACTION=="remove", ENV{ID_PCI_CLASS_FROM_DATABASE}=="Display controller", RUN+="/usr/local/bin/oculink-gpu-manager remove %k"
-
-# Handle driver unbinding (safer removal detection)
-SUBSYSTEM=="pci", ACTION=="unbind", DRIVER=="amdgpu", RUN+="/usr/local/bin/oculink-gpu-manager unbind %k"
+SUBSYSTEM=="pci", ACTION=="add", ENV{PCI_CLASS}=="3????", RUN+="/usr/local/bin/oculink-gpu-manager add %k"

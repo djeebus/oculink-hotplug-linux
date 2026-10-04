@@ -1,17 +1,21 @@
 #!/bin/bash
-# Runtime kernel configuration for safe OCuLink hot-removal
+# Runtime PCIe configuration for safe OCuLink hot-removal
 # No bootloader changes needed!
 
 LOG="/var/log/oculink-kernel-config.log"
+
+OCULINK_LIB="$(dirname -- "$(readlink -f -- "$0")")/oculink-common.sh"
+[ -r "$OCULINK_LIB" ] || OCULINK_LIB=/usr/local/lib/oculink/oculink-common.sh
+source "$OCULINK_LIB" || exit 1
 
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG"
 }
 
-log_msg "Configuring kernel for OCuLink hot-plug safety..."
+log_msg "Configuring PCIe for OCuLink hot-plug safety..."
 
-# Find discrete GPU
-GPU_PCI=$(lspci | grep -i "amd.*vga" | grep -v -i "hawkpoint" | head -1 | cut -d' ' -f1)
+# Find discrete GPU (full address, e.g. 0000:c6:00.0)
+GPU_PCI=$(find_oculink_gpus | head -1)
 if [ -z "$GPU_PCI" ]; then
     log_msg "No discrete GPU found at boot - will configure when connected"
     exit 0
@@ -19,87 +23,29 @@ fi
 
 log_msg "Found discrete GPU at: $GPU_PCI"
 
-# Runtime kernel parameters via sysfs
+# Runtime parameters via sysfs
 configure_pcie_hotplug() {
-    local pci_addr="0000:$1"
-    
-    # Enable surprise removal capability
+    local pci_addr="$1"
+
     if [ -d "/sys/bus/pci/devices/$pci_addr" ]; then
         # Set power control to auto (allows runtime PM)
         echo "auto" > "/sys/bus/pci/devices/$pci_addr/power/control" 2>/dev/null || true
-        
+
         # Enable D3cold for better power management
         echo "1" > "/sys/bus/pci/devices/$pci_addr/d3cold_allowed" 2>/dev/null || true
-        
-        # Set link power management
-        if [ -f "/sys/bus/pci/devices/$pci_addr/link/l1_aspm" ]; then
-            echo "1" > "/sys/bus/pci/devices/$pci_addr/link/l1_aspm" 2>/dev/null || true
-        fi
-        
+
         log_msg "Configured PCIe device $pci_addr for hot-removal"
     fi
 }
 
-# Configure the GPU's PCIe port
 configure_pcie_hotplug "$GPU_PCI"
 
-# Find and configure parent bridge
-PARENT_BRIDGE=$(readlink -f "/sys/bus/pci/devices/0000:$GPU_PCI/.." | xargs basename)
-if [ -n "$PARENT_BRIDGE" ]; then
-    log_msg "Configuring parent bridge: $PARENT_BRIDGE"
-    echo "1" > "/sys/bus/pci/devices/$PARENT_BRIDGE/rescan" 2>/dev/null || true
+# AMDGPU module parameters (gpu_recovery, runpm, lockup_timeout) are read-only
+# at runtime, so they can only be set on the kernel command line or in
+# /etc/modprobe.d, e.g.:
+#   options amdgpu gpu_recovery=1
+if [ -r /sys/module/amdgpu/parameters/gpu_recovery ]; then
+    log_msg "amdgpu gpu_recovery=$(cat /sys/module/amdgpu/parameters/gpu_recovery)"
 fi
 
-# Set kernel runtime parameters for PCIe error handling
-log_msg "Setting PCIe error recovery parameters..."
-
-# Enable PCIe Advanced Error Reporting (AER)
-echo "1" > /sys/module/pcieaer/parameters/pcieaer_force 2>/dev/null || true
-
-# Configure PCIe port driver
-echo "pcie_ports=native" > /sys/module/pcie_port/parameters/ports 2>/dev/null || true
-
-# AMD GPU specific settings for resilience
-if [ -d "/sys/module/amdgpu/parameters" ]; then
-    log_msg "Configuring AMDGPU driver for hot-removal..."
-    
-    # Enable GPU recovery on errors
-    echo "1" > /sys/module/amdgpu/parameters/gpu_recovery 2>/dev/null || true
-    
-    # Enable runtime power management
-    echo "1" > /sys/module/amdgpu/parameters/runpm 2>/dev/null || true
-    
-    # Set timeout for GPU operations (prevent hangs on removal)
-    echo "1000" > /sys/module/amdgpu/parameters/lockup_timeout 2>/dev/null || true
-fi
-
-# Create a watchdog for surprise removal
-log_msg "Setting up surprise removal monitor..."
-
-# Monitor PCIe errors and handle them gracefully
-cat > /tmp/oculink-pcie-monitor.sh << 'MONITOR'
-#!/bin/bash
-# Monitor for PCIe errors indicating surprise removal
-
-dmesg -w | while read line; do
-    if echo "$line" | grep -qE "PCIe.*error|AER.*error|GPU.*removed|pciehp.*surprise"; then
-        # Detected potential surprise removal
-        echo "$(date): PCIe error detected - handling surprise removal" >> /var/log/oculink-surprise.log
-        
-        # Clean up GPU resources
-        pkill -f "amdgpu" 2>/dev/null || true
-        
-        # Force rescan to clean up
-        echo "1" > /sys/bus/pci/rescan 2>/dev/null || true
-        
-        # Notify user
-        DISPLAY=:0 notify-send --urgency=critical "GPU Event" "Handling surprise GPU removal..." 2>/dev/null || true
-    fi
-done &
-MONITOR
-
-chmod +x /tmp/oculink-pcie-monitor.sh
-/tmp/oculink-pcie-monitor.sh &
-
-log_msg "OCuLink kernel safety configuration complete!"
-log_msg "System is now prepared for surprise GPU removal"
+log_msg "OCuLink PCIe configuration complete!"
